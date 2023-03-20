@@ -1,0 +1,10 @@
+---
+title: "テスト記事"
+emoji: "😸" # アイキャッチとして使われる絵文字（1文字だけ）
+type: "tech" # tech: 技術記事 / idea: アイデア記事
+topics: [] # タグ。["markdown", "rust", "aws"]のように指定する
+published: true # 公開設定（falseにすると下書き）
+---
+# 概要
+
+これはテスト記事です。
