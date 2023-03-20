@@ -1,0 +1,305 @@
+
+
+# R-CNN の系譜を辿る
+
+YOLO などの物体検知系の論文を読むにあたって様々 R-CNN に関連する単語が出てきたので、
+ひとまず R-CNN 系の論文を抑えておこうと思いまとめています。
+
+## 歴史の系譜
+
+物体検知では画像中の物体の位置を推定し、その物体が何であるかを識別するタスクを解きます。
+代表的な論文は以下の流れで発展してきました。
+畳み込みニューラルネットワーク（CNN）を基盤として、物体の位置（Region）を推定するので R-CNN という名前になっています。
+
+- R-CNN(2013)
+- Fast R-CNN(2015)
+- Faster R-CNN(2015)
+- Mask R-CNN(2015)
+
+
+## 概要
+
+R-CNN系の処理フローの概要を示した分かりやすい図が [2] で紹介されていたので引用します。
+物体検知では物体を囲むバウンディングボックスを予測し、かつバウンディングボックス内の物体のクラス分類を解く。
+そのため各モデルの出力は Box offset regressor（なぜ offset なのかは後述したい）と classifier の二種類存在している。
+
+各モデルでは画像の中のどのあたりに検知対象があるかをまず大まかに抽出するところから始める。
+この実装方法で、Fast R-CNN 以前以後に分けられる。
+以前ではパターン認識の技術を用いて（非ディープ）で物体の位置を大まかに判定したあとに推定を行う（Region Proposal）が、以後では物体の位置推定からディープで行っている（Region Proposal Network; RPN）。
+
+![](./img/note/20230320-093200.png)
+
+
+# R-CNN
+
+- [Rich feature hierarchies for accurate object detection and semantic segmentation Tech report (v5)](https://arxiv.org/pdf/1311.2524.pdf)
+
+
+## 概要
+
+R-CNN の画像分類部分は下図のような処理フローを採っています。
+R-CNNではまず、画像から「この辺りに物体があります」という領域を抽出するための Region Proposal と呼ばれる処理を行います^[論文時点では様々な手法があったそうですが、selective search と呼ばれる手法を用いています]。
+これは元論文では記載がないのですが、以降の論文で出てくる Region Of Interest（RoI）の抽出に相当しています。
+抽出した領域を CNN の入力情報とし、クラス分類を SVM に解かせます。
+
+![](./img/note/20230320-094504.png)
+*元論文より。処理の概要*
+
+
+抽出した領域（RoI）は CNN への入力時に 227x227 の固定サイズに変形しています。
+おそらくこの時点ではまだ（古典的な）画像処理の技術が主流であったこともあり、「warped region」という単語を使っているのだと思います（現在なら resized image とかでしょうか）。この変換の仕方をどうすればよいかについては Appendix A で議論されています。
+
+![](./img/note/20230320-101632.png)
+*RoIの変換方法の調査について（Figure7）。正方形の入力サイズを想定しているので、縦長の画像はアスペクト比が崩れた画像になってしまう。*
+
+
+
+## Bounding-box regression
+
+R-CNN やそれ以降のモデルでも問題となるのが、いかにして bounding box を予測するかという部分だと思われます。
+ここでは少し bounding box の予測方法に焦点を当てたいと思います。
+
+物体検知では物体を囲む矩形として bounding box（bbox）を予測する必要があり、R-CNN では bbox に関する回帰タスクを解いています（これ以降のモデルでも同様の回帰タスクを解くことになります）^[どうやってbboxを予測しているのかについてはなぜかAppendixに回されており（もしかすると従来手法と同じだからでしょうか）、そのためか R-CNN の bbox regression 部分を十分に紹介している技術ブログは少ない印象でした。]。
+
+物体検知では物体の位置について結果が不変であるようにする必要があります。
+bbox の座標を直接回帰分析させてしまうと、入力画像の大きさや画像中に物体の位置などの情報を陽に含んだ学習となってしまいます。
+そこで scale invariant な予測が可能にするために、「offset」を予測させるという手法を採ります。
+まず scale invariant とは
+
+- 1枚の画像中に大小様々な人がいるときに「人」に対してのそれぞれの bbox を計算できるか
+- 学習データ／本番データの解像度が異なる際に性能を保てるか
+
+などの問題に対する不変性です。bounding box の不変性についての簡単な議論は [3] や bbox の座標と不変性の関係性については[1]が詳しいのですが、自分なりに少しまとめてみようと思います。
+
+
+### R-CNN における bbox regression の概要
+
+回帰分析に使用する学習データは $\{(P^i, G^i)\}_{i=1,...,N}$ で、$P^i = (p_x,p_y,p_w,p_h)$ は selective search が抽出した RoI の中心座標 $(x,y)$ とその幅と高さ、$G^i$ は同様に bbox の真値（ground truth）です。
+仮に単純な回帰タスクであれば、下図の赤取り消し線で示したように CNN に入力された画像から bbox の座標 $(q_x,q_y,q_w,q_h)$ 直接予測して最適化計算をすることになると思いますが、ここでは別の手法を採ります。
+
+今学習したいのは $P$ が与えられた時に^[元論文の $P$ は Proposal の頭文字から来ていると思いますが、どうも Predict がちらついて読みにくかったです。この $P$ は CNN の Predict ではなく、Selective search の Proposal です。] どれくらい補正すれば正解の $G$ になるかの offset です。概要を下図にまとめます。
+
+![](./img/note/Untitled2.png)
+*R-CNNの bounding-box regressor の概要*
+
+学習手順は
+
+1. RoI を計算し、CNNへの入力情報を抽出する
+2. CNN を計算し出力値を得る
+3. RoI と Ground truth の差分を別途計算する
+4. CNN の出力値で、上記の差分を表現できるように学習する
+
+です。（少しややこしいことを敢えて言ってしまうようですが） CNN学習時には RoI と Ground Truth は固定値です。RoI は Selective Search の出力結果なので正確には固定ではないですが、CNNを学習する時点では固定値として考えるほうが分かりやすいと思います。また Ground Truth は使用するデータセットで事前にアノテーションされているものです。RoI と Ground Truth にズレがあるのは、そもそもの Selective Search の性能の限界です。それを込みで CNN には「こういう RoI が入力されると ground truth はどこに位置しているでしょう」というタスクを学習してもらいます。
+ここで$P$ から $G$ への変換は
+
+$$
+g_x = p_w t_x + p_x \\
+g_y = p_w t_y + p_y \\
+g_w = p_w \exp(t_w) \\ 
+g_h = p_h \exp(t_h) 
+$$
+
+であり、変換式（変換係数）は
+
+$$
+t_x = (g_x - p_x)/p_w \\
+t_y = (g_y - p_y)/p_h \\
+t_w = \log (g_w/p_w) \\
+t_h = \log (g_h/p_h) 
+$$
+
+
+となります^[高さと幅の変換になぜ exponential を使っているのか自分では調査しきれなかったのですが、変換後に $g_w, g_h$ がゼロにならないようにしておきたい、くらいの意味でしょうか。]。この変換式については「YOLO anchor box coordinate」とかで適当に調べると分かりやすい図が出てくるので割愛しますが、一つ引用しておきます[4]^[anchor box という概念になるのでまた別ですが、考え方は同じです。]。
+
+![](./img/note/20230320-122255.png)
+
+ここで CNN の出力に話を戻しますが、RoI で抽出した画像から何らかの特徴量ベクトルを作成します。「region Proposal の画像を畳み込んだ」という意味を込めて $\phi(P)$ と表しておくと、変換式は
+
+$$
+d_\star(P) = w_\star^T\phi(P),~~~(\star=x,y,w,h)
+$$
+
+と表現することができます。CNNの出力としての変換式 $d_\star$ が実際の変換式 $t_\star$ に近づくように学習するのが、本論文における box regression です。AppendixC (5) 式にもあるようにリッジ回帰を使って
+
+$$
+\hat{w}_\star = \argmin \sum_{i=1}^N (t_\star^i - w_\star^T \phi(P^i)) + \lambda \|w_\star \|^2
+$$
+
+を解きます（CNNの出力は同じで、それぞれの変換式ごとに最適化計算を実施するという形でしょうか）。
+以上が bounding-box regressor の概要です。
+
+
+
+
+
+
+
+
+
+# Fast R-CNN
+
+- [Fast R-CNN](https://arxiv.org/pdf/1504.08083.pdf)
+
+## 概要
+
+R-CNN では元画像を RoI で抽出し、その抽出した画像ごとに CNN の計算を行っていました。
+その計算コストを削減するために元画像ではなく、一度 CNN に通した特徴量マップから抽出することとしたものが、Fast R-CNN です。
+ただし RoI を計算する部分に関してはまだ別途画像処理の手法を使用しています。
+
+![](./img/note/20230320-140012.png)
+*元論文より。処理の概要*
+
+
+Fast R-CNN では RoI pooling の実施後、RoI ごとに二種類の出力層で最終的な出力を計算します。
+まず RoI 中の物体がのどのクラスに属するかのクラス分類を解きます。出力値に softmax を掛けることで確率的に解釈し、 $(p_0,...,p_K)$ を出力とします（クラス数は $K+1$ とします）。
+またそれぞれのクラスに対して bounding box を予測し、R-CNN と同様の表式の $t^k = (t_x^k, t_y^k, t_w^k, t_h^k)$ を計算します。
+ground truth のクラスが $u$、bbox が $v$ としたときに Fast R-CNN の損失関数は
+
+$$
+L = L_{cls}(p, u) + \lambda L(t^k, v)
+$$
+
+と表されます。
+
+
+
+
+
+
+
+
+# Faster R-CNN
+
+- [Faster R-CNN: Towards Real-Time Object Detection with Region Proposal Networks](https://arxiv.org/pdf/1506.01497.pdf)
+
+Fast R-CNN までで使用されていた RoI 抽出部分も学習可能な Region Proposal Networks（RPNs）としてモデルの中に取り込んだモデルです。
+Fast R-CNN では RoI を計算する部分に計算コストが掛かっていた経緯がありその部分を刷新することで、精度と実行時間を改善しました。
+
+![](./img/note/20230320-141220.png)
+*元論文より。処理の概要*
+
+
+学習手順は Section3.2 にあるように
+
+1. ImageNet の事前学習済みモデル（ZF, VGG16）を使用して regino proposal task を解く
+2. ImageNet の事前学習済みモデル（ZF, VGG16）を使用して、手順(1)で出力した region proposal をもとに学習する
+3. 学習したモデルでRPNを初期化して、fine-tuingを実施
+4. Fast R-CNN 部分を fine-tuing するもとに学習する
+
+の4段階の手順で実施されます。
+このモデルでは anchor box が導入され^[YOLO系の論文を読んでいたときに anchor が登場し調べると R-CNN 系に辿り着いたので、本当は焦点を当てて理解したかったのは Faster R-CNN　です。]。
+
+
+
+## Region Proposal Networks（RPN）
+
+
+Fast R-CNN までで計算していた RoI を RPN という形でデータから学習するのですが、その際に「Anchor」という概念が登場します。
+Faster R-CNN で初出の概念ではないですが、anchor box を単純に default box [5] と読み替えたほうが言葉にとらわれず理解できるかもしれません。
+RPN では Fast R-CNN までではやってこなかった、直接 bbox の座標を予測するということを行います。
+ただし損失関数を計算するときには「アンカーボックスをどう変形するか」というタスクに読み替えて学習を行います。
+
+### Anchors
+
+一度 Faster R-CNN の文脈を離れ、一般的なアンカーボックスを導入します[6]。アンカーボックスは画像中の規定の場所（あるピクセル間隔で配置する）に規定のサイズを持った矩形であり、下図のように配置されます。
+
+![](./img/note/20230320-160211.png)
+*MathWorksの技術ブログより。*
+
+画像全体を処理するのではなく、このアンカーボックスに限って分類タスクを解くことで計算コストを抑え、かつ精度よく物体検知を行うことができます。
+例えば細長い物体を検知したいのであれば正方形ではなく長方形に近いアンカーボックスを配置し、それらに対してタスクを解くとより効率のよい
+物体検知が可能となります。
+
+元画像と特徴量マップとの関係性についてですが、これは単純にピクセルサイズで対応関係をつけているようです。
+「畳み込んだ時に周辺の情報も入ってくるので元画像のこのピクセルは、特徴量マップのこことここのピクセルに情報が含まれていて〜」と難しいことは考えず、下図のように単純に関係づけています。
+
+![](./img/note/Untitled4.png)
+*元画像と特徴量マップの対応付けの概要*
+
+元画像の 1 pixel にはいくつかのアンカーボックスが定義されていて、、特徴量マップを扱うときもそのアンカーボックスを念頭に置いて処理を進めてきます。
+
+
+### 入出力の概要
+
+
+RPN では VGG16 等の fully conv で作成した特徴量マップを $n\times n$ のカーネルで畳み込み（論文では $n=3$を使用）、畳み込んだあとの特徴量マップの 1 pixel それぞれに対して $k$ 個の bounding box を予測します。
+ここでいくつか自問自答をしておくと、
+
+1. なぜ $k$ 個の bounding box の予測なのか？
+   - RPN ではアンカーボックスを補正して bounding box を予測するというタスクを解きます。特徴量マップの 1 pixel は元画像のとある 1 pixel に対応しており、$k$ 個のアンカーボックスが紐付いています。そのため特徴量マップ 1 pixel につき $k$ 種類の出力を計算します。
+2. 予測する座標はどの平面上の座標か？
+   - （この部分については正確には論文から読み取れませんでしたがその上で考えてみると）元画像上での座標を計算し、その予測した領域（RoI）を特徴量マップ上に射影することで後段の RoI pooling に使用できる情報としていると思います。
+
+繰り返しになりますが、RPN では基準となるアンカーボックスを変形して region proposal を行います。
+基準も何もなく予測するタスクと比較して、補助情報があることでより正確に学習が進んでいるのだと思われます。
+処理概要を下図に示します。
+
+
+![](./img/note/Untitled3.png)
+*RPNの入力と出力の概要*
+
+
+RPNでは特徴量マップを入力に取り、物体が存在すると考えられる領域の矩形と物体らしさ（objectness score）を出力します。
+特徴量マップは VGG16 であれば $14 \times 14 \times 512$ 次元のテンソルであり^[max poolingまで含めると $7\times 7\times 512$になります]、これを $3\times 3$ で畳み込みます。
+ここで $2k$ もしくは $4k$ のチャンネルを出力する $1\times 1$ の畳み込みを行うと、特徴量マップの 1 pixel は 512 チャンネルを持っているので論文における（論文ではZFモデルの最終的に256チャンネルとなる場合で書いていますが、ここでは256-dを 512-d で読み替えてください）下図を畳み込み演算で表現することができます。
+
+![](./img/note/20230320-164826.png)
+
+
+
+### 損失関数
+
+ここまでで RPN の入出力を議論してきました。最後に学習方法について説明します。
+まず各アンカー（アンカーボックスの中心=特徴量マップの各ピクセル）には二値クラスラベルを割り振ります。正例の割り振り方としては、(i) 画像内で ground truth bbox との IoU が最も高いアンカーボックス、(ii) ground truth bbox との IoU が 0.7 を超えているアンカーボックス、これら二種類の割り振りを行います。
+
+また、二種類の変換式を考えます。
+RPN のタスクが「アンカーボックスを変形して ground truth bbox を予測する」ということを思い出すと、予測した bbox と ground truth bbox との差分が最小となるように学習したくなりますが、ここでは次の学習を行います。
+
+$$
+L_{reg}(t_i, t_i^\ast)
+$$
+
+$t_i, t_i^\ast$ はそれぞれ、アンカーボックスから予測bboxへの変換式、アンカーボックスから ground truth bbox への変換式であり、
+
+$$
+t_x = (x - x_a)/p_w \\
+t_y = (y - x_a)/p_h \\
+t_w = \log (w/w_a) \\
+t_h = \log (h/h_a) 
+$$
+と
+$$
+t_x^\ast = (x^\ast - x_a)/p_w \\
+t_y^\ast = (y^\ast - x_a)/p_h \\
+t_w^\ast = \log (w^\ast/w_a) \\
+t_h^\ast = \log (h^\ast/h_a) 
+$$
+
+です。$x,x_a,x^\ast$ はそれぞれ予測したbbox、アンカーボックス、ground truth bbox の情報です。
+ここで固定されている情報は $x_a$ と $x^\ast$ であり、$x$ は RPN で計算する情報です。
+この表式は (i) アンカーボックスから予測bbox の変形式と、(ii) アンカーボックスから ground truth bbox の変形式が同じになるように、
+という発想をもとにした表式となっています。
+
+損失関数全体は
+
+$$
+L = \frac{1}{N_{cls}} \sum_{i=1}^N L_{cls}(p_i, p_i^\ast) + \lambda\frac{1}{N_{reg}} \sum_{i=1} p_i^\ast L_{reg}(t_i, t_i\ast)
+$$
+
+です。
+
+
+## Fast R-CNN 
+
+ここまでで RPN についての概要を議論してきましたが、Faster R-CNN ではあくまでも RoI を計算するために RPN を用意しており、実際に物体検知を行うのは後段の Fast R-CNN の部分です。
+Fast R-CNN の部分は従来の selective search から RPN に置き換わっただけで学習方法は同様のため割愛します。
+
+
+# 参考文献
+
+- [1] https://www.telesens.co/2018/03/11/object-detection-and-classification-using-r-cnns/
+- [2] https://lilianweng.github.io/posts/2017-12-31-object-recognition-part-3/
+- [3] https://stackoverflow.com/questions/55553747/what-is-scale-invariance-and-log-space-translations-of-a-bounding-box
+- [4] https://christopher5106.github.io/object/detectors/2017/08/10/bounding-box-object-detectors-understanding-yolo.html
+- [5] https://openaccess.thecvf.com/content_WACV_2020/papers/Zhong_Anchor_Box_Optimization_for_Object_Detection_WACV_2020_paper.pdf
+- [6] https://jp.mathworks.com/help/vision/ug/anchor-boxes-for-object-detection.html
