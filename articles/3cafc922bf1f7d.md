@@ -1,5 +1,5 @@
 ---
-title: ""
+title: "VAE 理解までの道のり"
 emoji: "🐥"
 type: "tech" # tech: 技術記事 / idea: アイデア
 topics: []
@@ -7,11 +7,9 @@ published: false
 ---
 
 
+# はじめに
 
-# VAE 
-
-Variational Autoencoder（VAE）と呼ばれるモデルが提案されたのは 2014 年の [Auto-Encoding Variational Bayes](https://arxiv.org/pdf/1312.6114.pdf) です。
-ただ VAE の何がすごいのか、Stable Diffusion などの前処理でもいまだ VAE が使用されていますが、何が凄いのか、よく分からなかったので本稿でその背景に迫ってみたいと思います。
+Variational Autoencoder（VAE）と呼ばれるモデルが提案されたのは 2014 年の [Auto-Encoding Variational Bayes](https://arxiv.org/pdf/1312.6114.pdf) です。ただ VAE の何がすごいのか、Stable Diffusion などの前処理でもいまだ VAE が使用されていますが、何が凄いのか、よく分からなかったので本稿でその背景に迫ってみたいと思います。
 
 
 Autoencoder との比較記事などがあり、「え、VAEは AutoencoderのSOTAなの？」と思ったりしていたのですが、特に元論文にそのような記載もないので混乱していました。
@@ -125,7 +123,7 @@ EMアルゴリズムを題材として、最尤推定とベイズ推定の違い
 ## 最尤法的な取り扱い （通常のEMアルゴリズム）
 
 
-EM アルゴリズムは最尤推定の計算方法の一つで、潜在変数を持つモデルの likelihood を最大化するパラメータ $\theta$ を求めることを目的としています。
+EM アルゴリズムは最尤推定の計算方法の一つで、潜在変数を持つモデルの likelihood を最大化するパラメータ $\theta$ を求めることを目的としています^[混合ガウス分布はEMアルゴリズムを使用するために、確率的に解釈して $p(z)$ を導入していました。もともと潜在変数を持っていなくても、EMアルゴリズムの枠組みに合わせてモデルを修正することもあるということです。]。
 
 観測した変数と潜在変数のどちらの情報も分かっていれば（$X, Z$ は complete dataset と呼ばれます）^[こうなると最早 $Z$ が "潜在" 変数ではないのですが...。]、
 
@@ -139,10 +137,94 @@ $$
 \ln p(X, Z|\theta) = \ln \left( \Sum_Z p(X, Z|\theta) \right) = \ln p(X|\theta)
 $$
 
-ここで $p(X|\theta)$ の最適化は難しいが、$p(X,Z|\theta)$ の最適化は比較的簡単である場合を想定します。
+ここで $p(X|\theta)$ の最適化は難しいが^[混合ガウス分布における $\ln p(\rm{X}|\pi, \mu, \Sigma) = \sum_{n=1}^N \ln \left\{\sum_{k=1}^K \pi_k N(\rm{x}_n|\mu_k, \Sigma_k) \right\}$]、$p(X,Z|\theta)$ の最適化は比較的簡単である場合を想定します。潜在変数の分布 $q(\rm{Z})$ を導入する^[「ベイズ推定 = 事前分布を導入する」と思っていたりすると「EMアルゴリズムは最尤推定の計算方法なのに、事前分布である $q(\rm{Z})$ を導入する...？」と混乱してしまいますが、最尤推定とはパラメータ $\theta$ の決定的な値を求める手法であるということを改めて確認しておきましょう。]ことで、対数尤度を次のように変形することができます：
 
 
-ベイズ推定 = 事前分布を導入すること、と思っているとここで「あれ、EMアルゴリズムは最尤法であると言っておきながら、事前分布 $q(Z)$ が出てきた？？」となってしまいます。が、パラメータ $\theta$ の決定的な値を求めるのだ、ということを頭に再度入れておきましょう。
+$$
+\begin{aligned}
+\ln p(\rm{X}|\theta) 
+&= \ln \frac{p(\rm{X}, \rm{Z}|\theta)}{p(\rm{Z}|\rm{X}, \theta)} \\
+&= \ln \left\{ \frac{p(\rm{X}, \rm{Z}|\theta)}{p(\rm{Z}|\rm{X}, \theta)}\frac{q(Z)}{q(Z)} \right\}\\
+&= \ln \left\{ \frac{p(\rm{X}, \rm{Z}|\theta)}{q(Z)}\frac{q(Z)}{p(\rm{Z}|\rm{X}, \theta)} \right\}\\
+&= \ln \frac{p(\rm{X}, \rm{Z}|\theta)}{q(Z)} - \ln \frac{p(\rm{Z}|\rm{X}, \theta)}{q(Z)} \\
+\sum_{{\rm{Z}}}q({\rm{Z}}) \ln p(X|\theta) 
+&= \sum_{{\rm{Z}}} q({\rm{Z}}) \ln \frac{p({\rm{X}}, \rm{Z}|\theta)}{q(Z)} - \sum_{\rm{Z} q(\rm{Z})} \ln \frac{p(\rm{Z}|\rm{X}, \theta)}{q(Z)} \\
+\end{aligned}
+$$
+
+よって
+
+$$
+\ln p(X|\theta) = 
+\sum_{\rm{Z}} q({\rm{Z}}) \ln \frac{p(\rm{X}, \rm{Z}|\theta)}{q(Z)} - \sum_{\rm{Z}} q({\rm{Z}}) \ln \frac{p(\rm{Z}|\rm{X}, \theta)}{q(Z)} 
+$$
+
+と変形することができます。
+1行目では確率の乗法定理を使用し、2行目では $q(Z)$ を導入しました^[$p(Z)$ とはまた別の形の分布です。]。また5行目では両辺に $q(\rm{Z})$ を掛けて、$\rm{Z}$ に対して和を取ると $\sum_{\rm{Z}} q(\rm{Z})=1$ であることを用いています。
+
+この式は以下のように表現することができます。
+
+$$
+\ln p(X|\theta) = L(q(Z), \theta) + \rm{KL} (q||p)
+$$
+
+第二項目は KL ダイバージェンスであり $\geq 0$ の量であることを踏まえると、
+
+$$
+\ln p(X|\theta) = L(q(Z), \theta) + {\rm{KL}} (q||p) \geq L(q(Z), \theta)
+$$
+
+対数尤度の下界が $L(q(Z), \theta)$ で表現できます。
+
+### イェンセンの不等式を使うパターン
+
+イェンセンの不等式を用いることで、対数尤度の下界をより直接的に求めることができます。
+
+$$
+\begin{aligned}
+\ln p(X|\theta)
+&= \ln \sum_Z p(X,Z|\theta) \\
+&= \ln \sum_Z q(Z)\frac{p(X,Z|\theta)}{q(Z)} \\
+&\geq \sum_Z q(Z) \ln \frac{p(X,Z|\theta)}{q(Z)} \equiv L(q(Z), \theta)\\
+\end{aligned}
+$$
+
+以上より対数尤度の下界が求まったので、$L$ を最大化するようなパラメータ $\theta$ を求めればよいことになります。ただしイェンセンの不等式を用いた議論でも、結局はKLダイバージェンスを用いた議論が必要になるので、先程もとめた関係式に戻ることになります。
+
+
+### パラメータ推定方法
+
+以上の議論から対数尤度を最大化するには、$L$ を最大化するようなパラメータ $\theta$ を求めれば良いことが分かりました。
+
+$$
+\ln p(X|\theta) \geq L(q(Z), \theta)
+$$
+
+しかしここで今一度、$L$ についての表式を確認してみると、
+
+$$
+L(q(Z), \theta) = \sum_{Z} q(Z) \ln \frac{p(X, Z|\theta)}{q(Z)} 
+$$
+
+$L$ はパラメータ $\theta$ の関数であると同時に、$q(Z)$ の汎関数であることが分かります。つまり $L$ を最大化するには $\theta$ と $q(Z)$ の組み合わせを見つける必要があるのですが、$q(Z)$ は関数であるのでこのままでは最適化を行うのが困難です。そこでEMアルゴリズムと呼ばれる枠組みが登場します。EMアルゴリズムでは $\theta$ と $q(Z)$ をそれぞれ逐次的に（別々に）更新することで対数尤度の最大化を行います。
+
+- Eステップ：$\underset{q}{\operatorname{argmax}}~L(q, \theta)$
+- Mステップ：$\underset{\theta}{\operatorname{argmax}}~L(q, \theta)$
+
+EM アルゴリズムでは二段階の逐次的最適化手法を採ることで、最尤推定値を見つけることができます。パラメータ $\theta$ を $\theta_1, \theta_2,...$ と徐々に探索していくことで最尤推定を行うのでうが、まず E ステップと呼ばれる段回では $\theta_i$
+
+
+#### Eステップ
+
+$\theta$ を固定して（1回目であれば初期値 $\theta_0$、$i$ 回目であればそれまでに更新された値 $\theta_i$）、$q$ に関して $L$ を最大化します。通常汎関数の最大化には変分法を使用するのですが、（通常の）EMアルゴリズムでは
+
+
+$$
+\ln p(X|\theta) = L(q(Z), \theta) + {\rm{KL}} (q||p) \geq L(q(Z), \theta)
+$$
+
+
+#### Mステップ
 
 
 ## ベイズ的な取り扱い （変分EMアルゴリズム）
